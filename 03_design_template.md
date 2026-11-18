@@ -3,7 +3,7 @@
 | 項目          | 内容                                               |
 | ----------- | ------------------------------------------------ |
 | 文書ID        | DES-FS-001                                       |
-| 版数          | 0.4                                              |
+| 版数          | 0.5                                              |
 | 作成日         | 2026-11-13                                       |
 | 作成者         | 儘田 雪                                             |
 | 参照する要件定義書   | REQ-FS-001（版数 0.1）                               |
@@ -18,6 +18,7 @@
 | 0.2 | 2026-11-13 | CRATE-FS-001 v0.4 を反映。使用クレートとバージョンを確定。YAML は `noyalib` を使用。`thiserror`・`tempfile` を使わず標準ライブラリで実装する形に変更（§2.2, §3.8, §9）。各関数で使うクレートを追記 | 儘田 雪 |
 | 0.3 | 2026-11-16 | 実装の状況との違いを §2 と §2.2 に注記（CRATE-FS-001 v0.5 §6）。設計の内容は変えていない |      |
 | 0.4 | 2026-11-17 | §2 と §2.1 の構成を、`workdir` の `file-search` ブランチ（コミット `c690c10`）に合わせて変更。D-05 を「非同期処理で作る」に決定（§11）。§2.2、§3.4、§3.5、§4.6、§4.7、§4.8、§4.11、§8 に実装との違いを注記。§3 以降の設計の内容は変えていない |      |
+| 0.5 | 2026-11-18 | 実装を正として、§2、§2.1、§3.1、§3.2、§3.3、§4.1、§4.7、§4.9、§4.11 を `workdir` の `file-search` ブランチ（コミット `a503496`）に合わせて変更。実装が条件を満たしていない点（C-01-04、C-09-02、除外パターン）は、条件を変えず注記した |      |
 
 ---
 
@@ -57,7 +58,7 @@ workdir/
 │       ├── scope.rs      # 検索範囲の定義と走査
 │       ├── meta.rs       # ls 相当：存在確認・一覧取得・パターンでの絞り込み・属性取得
 │       ├── content.rs    # cat 相当：バイナリ判定・文字コード判定・ストリーム読み込み
-│       ├── search.rs     # grep 相当：中身の検索（作り直し中）
+│       ├── search.rs     # 検索機能のまとめ役（`search_file`）。grep 相当の中身の検索もここに置く（作り直し中）
 │       ├── index.rs      # インデックス・キャッシュ
 │       ├── error.rs      # エラー型
 │       └── test_util.rs  # テスト用の一時ディレクトリ（TestDir）
@@ -73,11 +74,25 @@ workdir/
 
 > **構成の変更（2026-11-17）：** 版数 0.3 までは、独立したパッケージ `file_search/` の `src/` に各ファイルを置く構成としていた。実際には `workdir` パッケージの中に作っているため、`src/file_search/` にまとめる構成に改めた（`workdir` の `file-search` ブランチ、コミット `c690c10`）。同じパッケージには、目標データ管理のファイル（`src/main.rs` ほか）もある。
 >
-> **実装の状況（2026-11-17）：** `search.rs` は空の `search_file` だけである。`config.rs`、`scope.rs`、`meta.rs`、`content.rs`、`index.rs` の処理本体は `todo!()` のままである。テスト用の `TestDir` は `src/file_search/test_util.rs` と `tests/common/mod.rs` にある。
+> **実装の状況（2026-11-18）：** 次のとおり実装済みである。
+>
+> | モジュール | 実装済み | 未実装（`todo!()`） |
+> | --- | --- | --- |
+> | `config.rs` | `Config` と `Default`、`load_config`（読み込み）、`read_yaml` | `save_config`、`app_config_dir` |
+> | `scope.rs` | `SearchScope`、`SearchScope::from_config`、`Default` | `walk`（空のイテレータを返すだけ） |
+> | `meta.rs` | `FileInfo`、`ListResult`、`exists` | `list_files`、`get_metadata` |
+> | `search.rs` | `search_file`（§4.7） | 検索の処理 |
+> | `content.rs`、`index.rs` | — | すべて |
+> | `error.rs` | エラー型の定義 | `Display`、`source`、`From` |
+>
+> テスト用の `TestDir` は `src/file_search/test_util.rs` と `tests/common/mod.rs` にある。各モジュールのテストの枠は、中身が `todo!()` のままである。
 
 ### 2.1 モジュールの依存関係
 
 ```
+search（`search_file`）──┬─> config
+                         ├─> meta ──> scope
+                         └─> scope
 api（作り直す予定）──┬─> config
                     ├─> meta ──> scope
                     ├─> content
@@ -86,6 +101,8 @@ api（作り直す予定）──┬─> config
                     └─> index ──> meta, config
 （error は全モジュールから参照する）
 ```
+
+> **実装との違い（2026-11-18）：** 実装では、`search.rs` の `search_file` が `api.rs` のかわりに窓口になっている（コード中のコメントは「search機能のまとめ役」）。`search_file` は `config`、`meta`、`scope` を呼ぶ。上の図の上段が現在の実装、下段が設計である。
 
 - 依存は上から下への一方向とし、循環させない。
 - `api` 以外のモジュールは互いを呼び出さず、組み合わせは `api` で行う。ただし `search` は走査（`scope`）と読み込み（`content`）を使う。
@@ -136,14 +153,14 @@ CRATE-FS-001 v0.4 の評価結果に従う。
 
 | フィールド           | 型               | 既定値                      | 説明                | 要件           |
 | --------------- | --------------- | ------------------------ | ----------------- | ------------ |
-| root            | `PathBuf`       | 実行環境のルート（`/` または `C:\`）  | 走査の起点             | §3 ルートディレクトリ |
+| root            | `PathBuf`       | `.`（カレントディレクトリ）          | 走査の起点             | §3 ルートディレクトリ |
 | max_depth       | `Option<usize>` | `None`（制限なし）             | 再帰の深さ             | §3 再帰の深さ     |
 | exclude         | `Vec<String>`   | 空                        | 除外する glob パターン    | §3 除外条件      |
-| follow_symlinks | `bool`          | `true`                   | シンボリックリンクをたどるか    | §3 シンボリックリンク |
-| encodings       | `Vec<String>`   | `["UTF-8", "Shift_JIS"]` | 文字コードを判定するときに試す順番 | §6 文字コード     |
+| follow_symlinks | `bool`          | `false`                  | シンボリックリンクをたどるか    | §3 シンボリックリンク |
+| encodings       | `Vec<String>`   | `["utf-8"]`              | 文字コードを判定するときに試す順番 | §6 文字コード     |
 | max_memory_mb   | `u64`           | `100`                    | メモリ使用量の目安         | NFR-02       |
 | read_buffer_kb  | `usize`         | `64`                     | ストリーム読み込みのバッファサイズ | §6 読み込み方法    |
-| index_enabled   | `bool`          | `true`                   | インデックスを使うか        | §8 インデックス    |
+| index_enabled   | `bool`          | `false`                  | インデックスを使うか        | §8 インデックス    |
 
 **YAMLの例**
 
@@ -160,10 +177,13 @@ read_buffer_kb: 64
 index_enabled: true
 ```
 
+> **変更（2026-11-18）：** 既定値の `root`、`follow_symlinks`、`encodings`、`index_enabled` を、実装の `Default`（`config.rs`）に合わせた。版数 0.4 までは、`root` が実行環境のルート（`/` または `C:\`）、`follow_symlinks` が `true`、`encodings` が `["UTF-8", "Shift_JIS"]`、`index_enabled` が `true` だった。下の YAML の例は、値の例であり既定値ではない。
+
 **読み書きの実装（`noyalib`）**
 
 - `Config` に `#[derive(Serialize, Deserialize)]` と `#[serde(default)]` を付け、YAML に書かれていない項目には既定値（`Default` の実装）を使う（C-09-03）。
 - 読み込みは `noyalib::from_str`、書き込みは `noyalib::to_string` を使う。
+- 実装では、ファイルを文字列として読み（`read_yaml`）、その文字列を `noyalib::from_str` で `Config` に変換する（`load_config`）。
 
 **保存先**（`dirs::config_dir()` で取得する）
 | OS | 設定ファイル |
@@ -176,14 +196,24 @@ index_enabled: true
 
 ### 3.2 検索範囲 `SearchScope`
 
-`Config` から作る。呼び出すときに一部の項目だけ上書きすることもできる。
+`Config` から作る。
 
 | フィールド           | 型               | 説明                              |
 | --------------- | --------------- | ------------------------------- |
-| root            | `PathBuf`       | 起点（ユーザーが指定。未指定なら `Config.root`） |
-| max_depth       | `Option<usize>` |                                 |
+| root            | `PathBuf`       | 起点（`Config.root` をそのまま使う）        |
+| max_depth       | `Option<usize>` | `Config.max_depth` をそのまま使う       |
 | exclude         | `GlobSet`       | コンパイル済みの除外パターン                  |
-| follow_symlinks | `bool`          |                                 |
+| follow_symlinks | `bool`          | `Config.follow_symlinks` をそのまま使う |
+
+**作り方（実装）**
+
+- `SearchScope::from_config(config: &Config) -> SearchScope` で作る。`Result` ではなく、`SearchScope` を直接返す。
+- `from_config` は、`root`、`max_depth`、`follow_symlinks` を `Config` から移す。`exclude` は空の `GlobSet` にする。除外パターンの変換は、`from_config` ではなく、呼び出し側（現在は `search_file`）が `Config.exclude` から `GlobSetBuilder` で作り、`exclude` に入れる。
+- `SearchScope` には `Default` を実装している（`root` が空のパス、`max_depth` が `Some(0)`、`exclude` が空、`follow_symlinks` が `false`）。
+
+> **変更（2026-11-18）：** 版数 0.4 までは、「呼び出すときに一部の項目だけ上書きできる」「`root` はユーザーが指定し、未指定なら `Config.root`」としていた。実装の `from_config` は `root` を引数に取らないため、実装に合わせた。
+>
+> **実装との違い（2026-11-18）：** `search_file` は、`Config.exclude` のパターンごとに `GlobSetBuilder` を新しく作り、`scope.exclude` を置き換えている。このため、複数のパターンを書いても、最後の1つだけが `exclude` に残る（実行して確認した。`**/.git/**` と `**/target/**` を書いた YAML で、`GlobSet` の `len` が 1 だった）。この設計書は、全パターンをまとめた `GlobSet` を想定している（C-02-02）。実装がこのままでよいかは、決定を待つ。
 
 ### 3.3 ファイル情報 `FileInfo`
 
@@ -193,9 +223,11 @@ index_enabled: true
 | exists     | `bool`               | 存在するか                               | FR-01       |
 | is_text    | `bool`               | 人が読めるファイルか（バイナリなら `false`）          | §3 対象ファイル種別 |
 | size       | `u64`                | サイズ（バイト）                            | FR-04       |
-| modified   | `Option<SystemTime>` | 更新日時                                | FR-04       |
+| update     | `Option<SystemTime>` | 更新日時                                | FR-04       |
 | created    | `Option<SystemTime>` | 作成日時（OS・ファイルシステムが対応していない場合は `None`） | FR-04, 用語定義 |
 | is_symlink | `bool`               | シンボリックリンクか                          | §3          |
+
+> **変更（2026-11-18）：** フィールド名 `modified` を、実装の `update` に変更した。
 
 ### 3.4 検索条件 `Query`
 
@@ -274,9 +306,9 @@ index_enabled: true
 | 項目       | 内容                                                    |
 | -------- | ----------------------------------------------------- |
 | 対応する要件ID | FR-01                                                 |
-| シグネチャ    | `pub fn exists(path: &Path) -> Result<bool, FsError>` |
-| 概要       | 指定したパスが存在するか判定する。バイナリファイルも判定できる                       |
-| 入力       | 判定したいパス                                               |
+| シグネチャ    | `pub fn exists(conf: &Config) -> Result<bool, FsError>` |
+| 概要       | `Config.root` で指定したパスが存在するか判定する。バイナリファイルも判定できる                       |
+| 入力       | 設定（`Config.root` を判定する）                                               |
 | 出力       | 存在すれば `true`、しなければ `false`                            |
 | エラー      | 権限がなく判定できない場合は `PermissionDenied`                     |
 | 再利用の想定   | 常駐化したときの監視対象の確認、インデックスの有効性確認                          |
@@ -287,6 +319,10 @@ index_enabled: true
 | C-01-02 | 存在しないパスに対して `Ok(false)` を返す（エラーにしない）            |
 | C-01-03 | バイナリファイルでも存在を判定できる                              |
 | C-01-04 | 権限エラーのときは `Err(PermissionDenied)` を返し、panic しない |
+
+> **変更（2026-11-18）：** 版数 0.4 までは、引数が `path: &Path` で、判定したいパスを直接渡す形だった。実装は `conf: &Config` を受け取り、`Config.root` を判定する。
+>
+> **実装との違い（2026-11-18）：** 実装は `Path::exists` で判定するため、権限がなくて判定できない場合も `Ok(false)` を返す。`Err(PermissionDenied)` を返す分岐はあるが、到達しない。C-01-04 は、実装では満たしていない。C-01-04 の扱いは、決定を待つ。
 
 ### 4.2 `walk`（scope.rs）
 
@@ -399,6 +435,16 @@ index_enabled: true
 
 ### 4.7 `search_content`（search.rs）
 
+> **実装の状況（2026-11-18）：** `search_content` はコードにない。`search.rs` には、検索機能の窓口として `pub async fn search_file(path: &Path)` がある。引数は設定ファイル（YAML）のパスで、次の順に処理し、結果は標準出力に表示する。
+>
+> 1. `load_config(Some(path))` で `Config` を読み込む（失敗したら表示して終わる）
+> 2. `exists(&conf)` で `Config.root` の存在を確認する
+> 3. 存在すれば `SearchScope::from_config` で `SearchScope` を作る
+> 4. `Config.exclude` から `GlobSet` を作り、`scope.exclude` に入れる（§3.2 の注記を参照）
+> 5. `SearchScope` を表示する
+>
+> 走査と検索は、まだ行っていない。以下の仕様は、設計の内容のままである。
+
 | 項目       | 内容                                                                                                                                               |
 | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 対応する要件ID | FR-06（FR-03 の絞り込みを含む）                                                                                                                            |
@@ -449,7 +495,7 @@ index_enabled: true
 | 項目       | 内容                                                                                                                                                        |
 | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 対応する要件ID | §7.1 設定項目、§7.2 設定ファイルへの反映                                                                                                                                 |
-| シグネチャ    | `pub fn load_config(path: Option<&Path>) -> Result<Config, FsError>`<br>`pub fn save_config(config: &Config, path: Option<&Path>) -> Result<(), FsError>` |
+| シグネチャ    | `pub async fn load_config(path: Option<&Path>) -> Result<Config, FsError>`<br>`pub fn save_config(config: &Config, path: Option<&Path>) -> Result<(), FsError>` |
 | 概要       | YAML の設定ファイルを読み込む／生成する。`path` が `None` なら §3.1 の保存先を使う                                                                                                    |
 | 動作       | 設定ファイルがない場合、`load_config` は既定値を返す。`save_config` はディレクトリがなければ作る                                                                                            |
 | 使うクレート   | `noyalib`（`from_str` / `to_string`）、`dirs`（`config_dir()`）                                                                                                |
@@ -457,6 +503,10 @@ index_enabled: true
 | 再利用の想定   | 常駐プロセスの起動時の読み込み、ブラウザ連携からの設定変更                                                                                                                             |
 
 > 読み込みと書き込みは対になる処理で、どちらも `api` からしか呼ばないため、1つのモジュールにまとめる。
+
+> **変更（2026-11-18）：** `load_config` を `async fn` にした（非同期処理で作ると決めたため。§11 D-05）。`save_config` は同期のままで、まだ実装していない。
+>
+> **実装との違い（2026-11-18）：** 実装の `load_config` は、`path` が `None` のとき `Err(NotFound)` を返す。§3.1 の保存先を使う処理（`app_config_dir`）は未実装である。また、設定ファイルが読めない場合は、既定値ではなく `Err` を返す（C-09-02 を満たしていない）。`Err` を文字列にする `Display` が未実装のため、読めないファイルを渡すと panic する。これらの扱いは、決定を待つ。
 
 | 条件ID    | 条件                                                                |
 | ------- | ----------------------------------------------------------------- |
@@ -513,6 +563,8 @@ impl Searcher {
 | C-11-04 | 常駐プロセスから使うことを考え、`Searcher` を作り直さずに何度でも呼び出せる     |
 
 > **実装との違い（2026-11-17）：** `api.rs` は、ひな形を削除したためコードにない。あとで作り直す。C-11 の結合テストの枠（`tests/api.rs`）は残っている。
+>
+> **実装との違い（2026-11-18）：** 現在は `search.rs` の `search_file`（§4.7）が窓口の役割を担っている。C-11-02（`root` を指定しなかった場合は `Config.root`）は、`SearchScope::from_config` が `root` を引数に取らず、常に `Config.root` を使うため、「指定する」側の動作がない。
 
 ---
 
